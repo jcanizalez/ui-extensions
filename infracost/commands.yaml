@@ -1,0 +1,78 @@
+commands:
+  - runtime: "BASH" 
+    priority: 100   
+    after: true     
+    script: |
+      # Downloads and executes the Infracost installation script from its GitHub repository
+      echo "Downloading Infracost..."
+      curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+      
+      # Runs 'terraform show' in JSON format on the specified plan file and stores the output in PLAN_CONTENT
+      echo "Extracting Terraform Plan JSON and save to context..."
+      PLAN_CONTENT=$(terraform show -json terraformLibrary.tfPlan)
+      
+      # Sends a POST request to the Terrakube API with the JSON plan data
+      # The plan data is included in the request body
+      curl --silent --output /dev/null --show-error -X POST "$terrakubeApi/context/v1/${jobId}" \
+           -H "Authorization: Bearer $terrakubeToken" \
+           -H "Content-Type: application/vnd.api+json" \
+           -d "{\"plan\": $PLAN_CONTENT}"
+
+      echo "Get the Plan json from CONTEXT..."
+      # Sends a GET request to the Terrakube API and stores the response in the RESPONSE variable
+      RESPONSE=$(curl --silent --show-error -X GET "${terrakubeApi}/context/v1/${jobId}" \
+                 -H "Authorization: Bearer ${terrakubeToken}" \
+                 -H "Content-Type: application/vnd.api+json")
+
+      echo "Saving response to file..."
+      echo "$RESPONSE" | jq '.plan' > plan.json
+
+      # Run infracost and display the result in console and save information
+      infracost breakdown --path plan.json
+      infracost breakdown --path plan.json --format json --out-file infracost.json
+      infracost upload --path infracost.json
+
+      # Path to the JSON file
+      infracost_path="infracost.json"
+      
+      # Check if the JSON file exists
+      if [ ! -f "$infracost_path" ]; then
+          echo "JSON file not found!"
+          exit 1
+      fi
+
+
+      # Start of the HTML file
+      cat <<EOF > breakdown.html
+      <div>
+          <h2>Infracost Breakdown</h2>
+          <table style="width: 100%; border-collapse: collapse; table-layout: auto;">
+              <tr style="background-color: #f2f2f2;">
+                  <th style="border: 1px solid black; padding: 8px;">Resource Name</th>
+                  <th style="border: 1px solid black; padding: 8px;">Resource Type</th>
+                  <th style="border: 1px solid black; padding: 8px;">Monthly Cost</th>
+              </tr>
+      EOF
+      
+      # Parse JSON and append data to the HTML file
+      jq -r '.projects[].breakdown.resources[] | "<tr><td style=\"border: 1px solid black; padding: 8px;\">\(.name)</td><td style=\"border: 1px solid black; padding: 8px;\">\(.resourceType)</td><td style=\"border: 1px solid black; padding: 8px;\">\(.monthlyCost)</td></tr>"' "$infracost_path" >> breakdown.html
+
+      # End of the HTML file
+      cat <<EOF >> breakdown.html
+          </table>
+      </div>
+      EOF
+      echo "HTML file generated successfully."
+
+      html_content=$(<"breakdown.html")
+      
+      # Escape newlines and double quotes in HTML content
+      escaped_html=$(echo "$html_content" | sed 's/"/\\"/g' | awk '{printf "%s\\n", $0}')
+      
+      # Create the JSON object and store it in an environment variable
+      export TERRAKUBE_UI_JSON=$(echo "{\"terrakubeUI\": {\"100\": \"$escaped_html\"}}" | jq .)
+
+      curl --silent --output /dev/null --show-error -X POST "$terrakubeApi/context/v1/${jobId}" \
+           -H "Authorization: Bearer $terrakubeToken" \
+           -H "Content-Type: application/vnd.api+json" \
+           -d "$TERRAKUBE_UI_JSON"
